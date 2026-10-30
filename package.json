@@ -1,24 +1,44 @@
 {
   "name": "pi-profiles",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hot-swappable extension profiles for Pi: /profile in session, pi-profile at launch.",
-  "keywords": ["pi-package", "pi", "profiles"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "profiles"
+  ],
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=22.18"
+    "node": ">=20"
   },
   "bin": {
     "pi-profile": "./bin/pi-profile.mjs"
   },
-  "files": ["bin", "extensions", "src", "README.md"],
+  "files": [
+    "bin",
+    "extensions",
+    "src",
+    "README.md"
+  ],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "scripts": {
-    "test": "node --experimental-strip-types --import ./tests/register-loader.mjs --test tests/*.test.mjs"
+    "test": "node --import ./tests/register-loader.mjs --test tests/*.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/<you>/pi-profiles.git"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   }
 }

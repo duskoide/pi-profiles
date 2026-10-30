@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmod, lstat, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rmdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	ProfilesError,
 	appendMissing,
+	entryKey,
+	mergeKeep,
 	applyProfile,
 	parseProfileCommand,
 	readProfilesFile,
@@ -19,7 +21,7 @@ import {
 	validateProfileDefinition,
 	validateProfileName,
 	writeJsonFile,
-} from "../src/profiles-core.ts";
+} from "../src/profiles-core.js";
 
 async function setup({ settings = { packages: ["pkg-a", "pkg-b"], extensions: ["ext-a"] }, file } = {}) {
 	const dir = await mkdtemp(join(tmpdir(), "pi-profiles-"));
@@ -85,7 +87,8 @@ test("validateProfileDefinition rejects unknown keys and bad entries", () => {
 
 test("appendMissing keeps profile order and appends missing keep entries", () => {
 	assert.deepEqual(appendMissing(["a", "b"], ["b", "c"]), ["a", "b", "c"]);
-	assert.deepEqual(appendMissing([{ source: "a", extensions: ["x"] }], ["a"]), [{ source: "a", extensions: ["x"] }]);
+	// keep wins over a profile entry for the same package
+	assert.deepEqual(appendMissing([{ source: "a", extensions: ["x"] }], ["a"]), ["a"]);
 	assert.deepEqual(appendMissing([], ["./pi-config"]), ["./pi-config"]);
 });
 
@@ -255,8 +258,11 @@ test("undoProfile restores the previous set exactly", async () => {
 	const outcome = await undoProfile(paths);
 	assert.equal(outcome.changed, true);
 	assert.deepEqual(await readJson(settingsPath), original);
-	assert.equal((await readJson(profilesPath)).previous, null);
-	await assert.rejects(undoProfile(paths), /nothing to undo/);
+	assert.deepEqual((await readJson(profilesPath)).previous, { packages: ["other"], extensions: [], active: "work" });
+	// undo toggles back
+	await undoProfile(paths);
+	assert.deepEqual((await readJson(settingsPath)).packages, ["other"]);
+	assert.equal((await readJson(profilesPath)).active, "work");
 });
 
 test("removeProfile refuses the active profile", async () => {
@@ -280,4 +286,107 @@ test("resolveProfilePaths honors PI_PROFILES_FILE and tilde paths", () => {
 	assert.equal(paths.profilesPath.startsWith("/"), true);
 	const plain = resolveProfilePaths("~/.pi/agent", {});
 	assert.equal(plain.settingsPath.endsWith(".pi/agent/settings.json"), true);
+});
+
+test("entryKey ignores npm versions and git refs", () => {
+	assert.equal(entryKey("npm:pi-profiles@0.2.0"), "npm:pi-profiles");
+	assert.equal(entryKey("npm:@scope/pkg@^1"), "npm:@scope/pkg");
+	assert.equal(entryKey("npm:@scope/pkg"), "npm:@scope/pkg");
+	assert.equal(entryKey("git:github.com/me/pi-profiles@v1"), "git:github.com/me/pi-profiles");
+	assert.equal(entryKey("https://github.com/me/pi-profiles.git#main"), "https://github.com/me/pi-profiles");
+	assert.equal(entryKey({ source: "./pi-config", extensions: [] }), "./pi-config");
+});
+
+test("mergeKeep replaces a shadowing profile entry and warns", () => {
+	const { list, warnings } = mergeKeep(
+		["npm:x", { source: "npm:pi-profiles@0.1.0", extensions: [] }, "npm:pi-profiles"],
+		["npm:pi-profiles"],
+		"packages",
+	);
+	assert.deepEqual(list, ["npm:x", "npm:pi-profiles"]);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /overridden by keep/);
+	assert.deepEqual(mergeKeep(["npm:pi-profiles"], ["npm:pi-profiles"]).warnings, []);
+});
+
+test("switchProfile reports keep warnings", async () => {
+	const { paths, settingsPath } = await setup({
+		file: {
+			keep: { packages: ["./pi-config"] },
+			profiles: { work: { packages: [{ source: "./pi-config", extensions: [] }] } },
+		},
+	});
+	const outcome = await switchProfile({ paths, name: "work" });
+	assert.equal(outcome.warnings.length, 1);
+	assert.deepEqual((await readJson(settingsPath)).packages, ["./pi-config"]);
+});
+
+test("readProfilesFile rejects invalid profile names and definitions", async () => {
+	const { profilesPath } = await setup({ file: { profiles: { list: { packages: ["x"] } } } });
+	await assert.rejects(readProfilesFile(profilesPath), /reserved/);
+	await writeFile(profilesPath, JSON.stringify({ profiles: { "my profile": {} } }));
+	await assert.rejects(readProfilesFile(profilesPath), /invalid profile name/);
+	await writeFile(profilesPath, JSON.stringify({ profiles: { ok: { packages: "x" } } }));
+	await assert.rejects(readProfilesFile(profilesPath), /must be an array/);
+});
+
+test("writeJsonFile preserves tab indentation", async () => {
+	const { settingsPath } = await setup({ settings: null });
+	await writeFile(settingsPath, '{\n\t"a": 1\n}\n');
+	await writeJsonFile(settingsPath, { a: 2 });
+	assert.equal(await readFile(settingsPath, "utf8"), '{\n\t"a": 2\n}\n');
+});
+
+test("switch waits for Pi's settings lock and leaves no lock behind", async () => {
+	const { paths, settingsPath, dir } = await setup({ file: { profiles: { work: { packages: ["w"] } } } });
+	const lock = settingsPath + ".lock";
+	await mkdir(lock);
+	const pending = switchProfile({ paths, name: "work" });
+	await new Promise((r) => setTimeout(r, 100));
+	assert.deepEqual((await readJson(settingsPath)).packages, ["pkg-a", "pkg-b"], "must not write while locked");
+	await rmdir(lock);
+	await pending;
+	assert.deepEqual((await readJson(settingsPath)).packages, ["w"]);
+	assert.deepEqual((await readdir(dir)).filter((f) => f.endsWith(".lock")), []);
+});
+
+test("concurrent save and switch do not lose the save", async () => {
+	const { paths, profilesPath } = await setup({ file: { profiles: { work: { packages: ["w"] } } } });
+	await Promise.all([switchProfile({ paths, name: "work" }), saveProfile({ paths, name: "snap" })]);
+	const profiles = await readJson(profilesPath);
+	assert.deepEqual(Object.keys(profiles.profiles).sort(), ["snap", "work"]);
+	assert.equal(profiles.active, "work");
+});
+
+test("a failed switch leaves settings untouched", async () => {
+	const { paths, settingsPath, dir } = await setup({ file: { profiles: { work: { packages: ["w"] } } } });
+	const before = await readFile(settingsPath, "utf8");
+	await chmod(dir, 0o555);
+	try {
+		await assert.rejects(switchProfile({ paths, name: "work" }));
+	} finally {
+		await chmod(dir, 0o755);
+	}
+	assert.equal(await readFile(settingsPath, "utf8"), before);
+});
+
+test("appendSystemPrompt fields are validated and survive save --force", async () => {
+	assert.throws(() => validateProfileDefinition("a", { appendSystemPrompt: 1 }), /must be a string/);
+	assert.throws(() => validateProfileDefinition("a", { appendSystemPrompt: "x", appendSystemPromptFile: "y" }), /pick one/);
+	const { paths, profilesPath } = await setup({ file: { profiles: { snap: { appendSystemPromptFile: "p.md", packages: ["old"] } } } });
+	await saveProfile({ paths, name: "snap", force: true });
+	const profile = (await readJson(profilesPath)).profiles.snap;
+	assert.equal(profile.appendSystemPromptFile, "p.md");
+	assert.deepEqual(profile.packages, ["pkg-a", "pkg-b"]);
+});
+
+test("isolated profiles: validation, no settings switch, prompt ignored", async () => {
+	assert.throws(() => validateProfileDefinition("c", { agentDir: "x", packages: [] }), /does not apply/);
+	assert.throws(() => validateProfileDefinition("c", { agentDir: "x", share: ["../auth.json"] }), /relative paths/);
+	assert.throws(() => validateProfileDefinition("c", { agentDir: "" }), /non-empty/);
+	assert.doesNotThrow(() => validateProfileDefinition("c", { agentDir: "~/x", share: ["auth.json", "skills"], description: "d" }));
+	const { paths, settingsPath } = await setup({ file: { profiles: { clean: { agentDir: "c" } } } });
+	const before = await readFile(settingsPath, "utf8");
+	await assert.rejects(switchProfile({ paths, name: "clean" }), /exit and run: pi-profile clean/);
+	assert.equal(await readFile(settingsPath, "utf8"), before);
 });
